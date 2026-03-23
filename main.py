@@ -31,6 +31,7 @@ class Config:
     criterion: nn.Module = nn.CrossEntropyLoss()
     optimizer: optim.Optimizer = optim.Adam
     epoch: int = 3
+    test_dataset_size = 1000
 
 
 
@@ -161,7 +162,15 @@ def build_datasets():
         generator=torch.Generator().manual_seed(CFG.seed),
     )
 
-    return train_set, pool_set, test_dataset
+
+    remaining = len(test_dataset) - CFG.test_dataset_size
+    test_set, _ = random_split(
+        test_dataset,
+        [CFG.test_dataset_size, remaining],
+        generator=torch.Generator().manual_seed(CFG.seed),
+    )
+
+    return train_set, pool_set, test_set
 
 
 def make_loader(dataset, shuffle: bool) -> DataLoader:
@@ -355,9 +364,9 @@ def main():
             train_one_model(model,data, CFG.criterion, CFG.optimizer(params=model.parameters(),lr=CFG.learning_rate), CFG.epoch)
 
 
-    for i, model in enumerate(models):
-        loss_pr_example, correct_precentage = evaluate(model,test_loader,CFG.criterion)
-        print(f"loss of model {i} is {loss_pr_example} pr example and accuracy is {correct_precentage}")
+        for i, model in enumerate(models):
+            loss_pr_example, correct_precentage = evaluate(model,test_loader,CFG.criterion)
+            print(f"loss of model {i} is {loss_pr_example} pr example and accuracy is {correct_precentage}")
 
 if __name__ == "__main__":
     main()
