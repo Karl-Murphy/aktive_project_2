@@ -16,13 +16,13 @@ import random
 
 @dataclass
 class Config:
-    initial_training_size: int = 20
-    pool_size: int = 20
-    batch_size: int = 32
+    initial_training_size: int = 1000
+    pool_size: int = 10000
+    batch_size: int = 50
     learning_rate: float = 1e-3
-    pretrain_epochs: int = 3
-    active_rounds: int = 3
-    acquisition_size: int = 5
+    pretrain_epochs: int = 10
+    active_rounds: int = 50
+    acquisition_size: int = 10
     num_models: int = 10
     num_classes: int = 10
     num_workers: int = 0
@@ -30,7 +30,7 @@ class Config:
     seed: int = 42
     criterion: nn.Module = nn.CrossEntropyLoss()
     optimizer: optim.Optimizer = optim.Adam
-    epoch: int = 1
+    epoch: int = 3
 
 
 
@@ -174,15 +174,16 @@ def make_loader(dataset, shuffle: bool) -> DataLoader:
 
 
 
-def bootstrap_subset(dataset):
-    data, _ = random_split(dataset, [int(len(dataset) * 0.8), int(0.2 * len(dataset))])
-    return data
+def bootstrap_subset(dataset: Subset):
+    B = []
+    for i in range(len(dataset.indices)):
+        B.append(random.choice(dataset.indices))
+    return Subset(dataset.dataset,B)
 
 
-def pool_to_train(chosen,train_set : Subset,pool_set : Subset):
-    for i in chosen:
+def pool_to_train(chosen, train_set: Subset, pool_set: Subset):
+    for i in sorted(chosen.tolist(), reverse=True):
         train_set.indices.append(pool_set.indices.pop(i))
-
     return train_set, pool_set
 
 
@@ -313,13 +314,13 @@ def select_top_k(scores: torch.Tensor, k: int) -> torch.Tensor:
     return torch.topk(scores, k=k).indices
 
 
-def active_learning_round(models: List[nn.Module], pool_set: Subset) -> None:
+def active_learning_round(models: List[nn.Module], pool_set: Subset) -> Tuple[torch.Tensor, torch.Tensor]:
     pool_loader = make_loader(pool_set, shuffle=False)
 
     committee_preds = committee_predictions(models, pool_loader)
     voted_classes = majority_vote(committee_preds, CFG.num_classes)
 
-    acquisition_scores = vote_entropy(committee_preds,len(CLASSES))
+    acquisition_scores = vote_entropy(committee_preds,CFG.num_classes)
 
     chosen = select_top_k(acquisition_scores, CFG.acquisition_size)
 
@@ -341,11 +342,17 @@ def main():
         data = make_loader(bootstrapped_subset, shuffle=True)
         train_one_model(model,data, CFG.criterion, CFG.optimizer(params=model.parameters(),lr=CFG.learning_rate), CFG.pretrain_epochs)
 
-    for _ in range(CFG.epoch):
+    for _ in range(CFG.active_rounds):
 
         chosen, voted_classes = active_learning_round(models,pool_set)
 
         train_set, pool_set = pool_to_train(chosen, train_set, pool_set)
+
+
+        for model in models:
+            bootstrapped_subset = bootstrap_subset(train_set)
+            data = make_loader(bootstrapped_subset, shuffle=True)
+            train_one_model(model,data, CFG.criterion, CFG.optimizer(params=model.parameters(),lr=CFG.learning_rate), CFG.epoch)
 
 
     for i, model in enumerate(models):
