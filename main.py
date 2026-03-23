@@ -1,98 +1,58 @@
+import math
+from dataclasses import dataclass
+from typing import List, Tuple
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
-from torch.utils.data import random_split
-import sympy as sp
+from torch.utils.data import DataLoader, Subset, random_split
+import random
 
-Initial_training = 20
-train_pool = 20
-BATCH_SIZE = 5
-LEARNING_RATE = 1e-3
-EPOCHS = 3
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-epochs_active = 3
+# ============================================================
+# Config
+# ============================================================
 
-# ----------------------------
-# Data transforms
-# ----------------------------
-train_transform = transforms.Compose([
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomCrop(32, padding=4),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=(0.4914, 0.4822, 0.4465),
-        std=(0.2023, 0.1994, 0.2010)
-    )
-])
-
-test_transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=(0.4914, 0.4822, 0.4465),
-        std=(0.2023, 0.1994, 0.2010)
-    )
-])
+@dataclass
+class Config:
+    initial_training_size: int = 20
+    pool_size: int = 20
+    batch_size: int = 32
+    learning_rate: float = 1e-3
+    pretrain_epochs: int = 3
+    active_rounds: int = 3
+    acquisition_size: int = 5
+    num_models: int = 10
+    num_classes: int = 10
+    num_workers: int = 0
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    seed: int = 42
+    criterion: nn.Module = nn.CrossEntropyLoss()
+    optimizer: optim.Optimizer = optim.Adam
+    epoch: int = 1
 
 
 
-# ----------------------------
-# CIFAR-10 datasets and loaders
-# ----------------------------
-train_dataset = torchvision.datasets.CIFAR10(
-    root="./data",
-    train=True,
-    download=True,
-    transform=train_transform
-)
+CFG = Config()
 
-test_dataset = torchvision.datasets.CIFAR10(
-    root="./data",
-    train=False,
-    download=True,
-    transform=test_transform
-)
-
-rest_int = len(train_dataset)  - Initial_training
-
-Initial_train, rest  = random_split(train_dataset, [Initial_training, rest_int])
-
-rest_int2 = rest_int - train_pool
-
-pool, rest  = random_split(rest, [train_pool, rest_int2])
-
-
-train_loader = torch.utils.data.DataLoader(
-    Initial_train,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=0
-)
-
-pool_loader = torch.utils.data.DataLoader(
-    pool,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=0
-)
-
-test_loader = torch.utils.data.DataLoader(
-    test_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=0
-)
-
-
-
-classes = (
+CLASSES = (
     "plane", "car", "bird", "cat", "deer",
     "dog", "frog", "horse", "ship", "truck"
 )
 
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+
+
+# ============================================================
+# Model
+# ============================================================
+
 class SimpleCNN(nn.Module):
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes: int = 10):
         super().__init__()
 
         self.features = nn.Sequential(
@@ -103,7 +63,7 @@ class SimpleCNN(nn.Module):
             nn.Conv2d(32, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),   # 32x32 -> 16x16
+            nn.MaxPool2d(kernel_size=2),
 
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
@@ -112,7 +72,7 @@ class SimpleCNN(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),   # 16x16 -> 8x8
+            nn.MaxPool2d(kernel_size=2),
 
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
@@ -121,7 +81,7 @@ class SimpleCNN(nn.Module):
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2)    # 8x8 -> 4x4
+            nn.MaxPool2d(kernel_size=2),
         )
 
         self.classifier = nn.Sequential(
@@ -129,168 +89,268 @@ class SimpleCNN(nn.Module):
             nn.Linear(128 * 4 * 4, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(256, num_classes)
+            nn.Linear(256, num_classes),
         )
 
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self.features(x))
 
-model = SimpleCNN()
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+def build_model(number_of_models: int) -> list[nn.Module]:
+    models = []
+    for i in range(number_of_models):
+        set_seed(i)
+        models.append(SimpleCNN(num_classes=CFG.num_classes).to(CFG.device))
+    return models
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+
+# ============================================================
+# Data
+# ============================================================
+
+def get_transforms():
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.4914, 0.4822, 0.4465),
+            std=(0.2023, 0.1994, 0.2010),
+        ),
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.4914, 0.4822, 0.4465),
+            std=(0.2023, 0.1994, 0.2010),
+        ),
+    ])
+
+    return train_transform, test_transform
+
+
+def build_datasets():
+    train_transform, test_transform = get_transforms()
+
+    train_dataset = torchvision.datasets.CIFAR10(
+        root="./data",
+        train=True,
+        download=True,
+        transform=train_transform,
+    )
+
+    test_dataset = torchvision.datasets.CIFAR10(
+        root="./data",
+        train=False,
+        download=True,
+        transform=test_transform,
+    )
+
+    remaining = len(train_dataset) - CFG.initial_training_size
+    train_set, rest = random_split(
+        train_dataset,
+        [CFG.initial_training_size, remaining],
+        generator=torch.Generator().manual_seed(CFG.seed),
+    )
+
+    remaining_after_pool = remaining - CFG.pool_size
+    pool_set, _ = random_split(
+        rest,
+        [CFG.pool_size, remaining_after_pool],
+        generator=torch.Generator().manual_seed(CFG.seed),
+    )
+
+    return train_set, pool_set, test_dataset
+
+
+def make_loader(dataset, shuffle: bool) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=CFG.batch_size,
+        shuffle=shuffle,
+        num_workers=CFG.num_workers,
+    )
+
+
+
+def bootstrap_subset(dataset):
+    data, _ = random_split(dataset, [int(len(dataset) * 0.8), int(0.2 * len(dataset))])
+    return data
+
+
+def pool_to_train(chosen,train_set : Subset,pool_set : Subset):
+    for i in chosen:
+        train_set.indices.append(pool_set.indices.pop(i))
+
+    return train_set, pool_set
+
+
+# ============================================================
+# Train / Eval
+# ============================================================
+
+def train_one_model(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    epoch: int
+) -> Tuple[float, float]:
     model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    total_loss = 0.0
+    total_correct = 0
+    total_examples = 0
+
+    for i in range(epoch):
+        for images, labels in loader:
+            images = images.to(CFG.device)
+            labels = labels.to(CFG.device)
+
+            optimizer.zero_grad()
+            logits = model(images)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * images.size(0)
+            total_correct += (logits.argmax(dim=1) == labels).sum().item()
+            total_examples += labels.size(0)
+
+    return total_loss / total_examples, 100.0 * total_correct / total_examples
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module) -> Tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_examples = 0
 
     for images, labels in loader:
-        images, labels = images.to(device), labels.to(device)
+        images = images.to(CFG.device)
+        labels = labels.to(CFG.device)
 
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        logits = model(images)
+        loss = criterion(logits, labels)
 
-        running_loss += loss.item() * images.size(0)
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        total_loss += loss.item() * images.size(0)
+        total_correct += (logits.argmax(dim=1) == labels).sum().item()
+        total_examples += labels.size(0)
 
-    epoch_loss = running_loss / total
-    epoch_acc = 100.0 * correct / total
-    return epoch_loss, epoch_acc
-
-def evaluate(model, loader, criterion, device):
-
-    with torch.no_grad():
-        model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        for images, labels in loader:
-            images, labels = images.to(device), labels.to(device)
-
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-
-            running_loss += loss.item() * images.size(0)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-        epoch_loss = running_loss / total
-        epoch_acc = 100.0 * correct / total
-        return epoch_loss, epoch_acc
-
-# ----------------------------
-# Save model
-# ----------------------------
-torch.save(model.state_dict(), "cifar10_cnn.pth")
-print("Model saved to cifar10_cnn.pth")
-
-models = [model]
-
-#pre train
-
-for model in models:
-    for epoch in range(EPOCHS):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, DEVICE
-        )
+    return total_loss / total_examples, 100.0 * total_correct / total_examples
 
 
-#active loop
+# ============================================================
+# Committee inference
+# ============================================================
 
-for i in range(epochs_active):
-    model_pred = [[] for i in range(len(models))]
-    for i, model in enumerate(models):
-        model.to(DEVICE)
-        model.eval()
-        with torch.no_grad():
-            for image, label in pool:
-                image = image.unsqueeze(0).to(DEVICE)  # (1, 3, 32, 32)
-                out = model(image)                     # (1, 10) logits
-                probs = torch.softmax(out, dim=1)      # softmax over class dimension
-
-                pred_idx = probs.argmax(dim=1).item()
-                pred_label = classes[pred_idx]
-                model_pred[i].append(pred_label)
-    QBC_predictions = []
-    for i in range(len(pool)):
-        counts = []
-        for C in classes:
-            count = 0
-            for model in model_pred:
-                if model[i] == C:
-                    count += 1
-            counts.append((count,C))
-        QBC_predictions.append(max(counts))
-
-QBC_predictions
-
-model_pred = [[] for model in models]
-for i, model in enumerate(models):
-    model.to(DEVICE)
+@torch.no_grad()
+def predict_probabilities(model: nn.Module, loader: DataLoader) -> torch.Tensor:
     model.eval()
-    with torch.no_grad():
-        for image, label in pool:
-            image = image.unsqueeze(0).to(DEVICE)  # (1, 3, 32, 32)
-            out = model(image)                     # (1, 10) logits
-            probs = torch.softmax(out, dim=1)      # softmax over class dimension
+    all_probs = []
 
-            pred_idx = probs.argmax(dim=1).item()
-            true_label = classes[label]
-            pred_label = classes[pred_idx]
-            pred_conf = probs[0, pred_idx].item()
+    for images, _ in loader:
+        images = images.to(CFG.device)
+        logits = model(images)
+        probs = torch.softmax(logits, dim=1)
+        all_probs.append(probs.cpu())
 
-            print(f"true={true_label:>6} | pred={pred_label:>6} | conf={pred_conf:.2%}")
-            print(probs.squeeze(0).cpu())
-            model_pred[i].append(probs)
-
-#pre train
-
-for model in models:
-    for epoch in range(EPOCHS):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, DEVICE
-        )
+    return torch.cat(all_probs, dim=0)  # [N, C]
 
 
-#active loop
+@torch.no_grad()
+def committee_predictions(models: List[nn.Module], pool_loader: DataLoader) -> torch.Tensor:
+    """
+    Returns predicted class indices from each model.
+    Shape: [M, N]
+    """
+    preds = []
+    for model in models:
+        probs = predict_probabilities(model, pool_loader)
+        preds.append(probs.argmax(dim=1))
+    return torch.stack(preds, dim=0)
 
-for i in range(epochs_active):
-    model_pred = [[] for i in range(len(models))]
+
+def vote_entropy(predictions: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """
+    predictions: [M, N] class indices
+    returns: [N] vote entropy
+    """
+    num_models, num_items = predictions.shape
+    scores = torch.zeros(num_items, dtype=torch.float32)
+
+    for i in range(num_items):
+        votes = torch.bincount(predictions[:, i], minlength=num_classes).float()
+        probs = votes / num_models
+        nonzero = probs > 0
+        scores[i] = -(probs[nonzero] * torch.log2(probs[nonzero])).sum()
+
+    return scores
+
+
+def majority_vote(predictions: torch.Tensor, num_classes: int) -> torch.Tensor:
+    """
+    predictions: [M, N]
+    returns: [N]
+    """
+    num_items = predictions.shape[1]
+    final_preds = []
+
+    for i in range(num_items):
+        votes = torch.bincount(predictions[:, i], minlength=num_classes)
+        final_preds.append(votes.argmax())
+
+    return torch.stack(final_preds)
+
+
+# ============================================================
+# Active learning
+# ============================================================
+
+def select_top_k(scores: torch.Tensor, k: int) -> torch.Tensor:
+    k = min(k, scores.numel())
+    return torch.topk(scores, k=k).indices
+
+
+def active_learning_round(models: List[nn.Module], pool_set: Subset) -> None:
+    pool_loader = make_loader(pool_set, shuffle=False)
+
+    committee_preds = committee_predictions(models, pool_loader)
+    voted_classes = majority_vote(committee_preds, CFG.num_classes)
+
+    acquisition_scores = vote_entropy(committee_preds,len(CLASSES))
+
+    chosen = select_top_k(acquisition_scores, CFG.acquisition_size)
+
+    return chosen, voted_classes
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    train_set, pool_set, test_dataset = build_datasets()
+
+    test_loader = make_loader(test_dataset, shuffle=False)
+
+    models = build_model(CFG.num_models)
+
+    for model in models:
+        bootstrapped_subset = bootstrap_subset(train_set)
+        data = make_loader(bootstrapped_subset, shuffle=True)
+        train_one_model(model,data, CFG.criterion, CFG.optimizer(params=model.parameters(),lr=CFG.learning_rate), CFG.pretrain_epochs)
+
+    for _ in range(CFG.epoch):
+
+        chosen, voted_classes = active_learning_round(models,pool_set)
+
+        train_set, pool_set = pool_to_train(chosen, train_set, pool_set)
+
+
     for i, model in enumerate(models):
-        model.to(DEVICE)
-        model.eval()
-        with torch.no_grad():
-            for image, label in pool:
-                image = image.unsqueeze(0).to(DEVICE)  # (1, 3, 32, 32)
-                out = model(image)                     # (1, 10) logits
-                probs = torch.softmax(out, dim=1)      # softmax over class dimension
+        loss_pr_example, correct_precentage = evaluate(model,test_loader,CFG.criterion)
+        print(f"loss of model {i} is {loss_pr_example} pr example and accuracy is {correct_precentage}")
 
-                pred_idx = probs.argmax(dim=1).item()
-                pred_label = classes[pred_idx]
-                model_pred[i].append(pred_label)
-    QBC_predictions = []
-    QBC_vote_entropy = []
-    for i in range(len(pool)):
-        counts = []
-        vote_entropy = []
-        for C in classes:
-            count = 0
-            for model in model_pred:
-                if model[i] == C:
-                    count += 1
-            counts.append(count)
-            vote_entropy.append((count/len(models) * sp.log(count/len(models),2),C))
-        
-        QBC_predictions.append(max(counts))
-        QBC_vote_entropy.append(sum(vote_entropy))
+if __name__ == "__main__":
+    main()
